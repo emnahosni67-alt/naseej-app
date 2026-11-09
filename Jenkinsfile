@@ -46,7 +46,7 @@ pipeline {
         }
         stage('Verification des images') {
             steps {
-                sh 'docker images --format "{{.Repository}}:{{.Tag}}  {{.Size}}" | grep "naseej-.*:${TAG}"'
+                sh 'docker images --format "{{.Repository}}:{{.Tag}}  {{.Size}}" | grep -E "^naseej-[a-z]+:${TAG} "'
             }
         }
     }
