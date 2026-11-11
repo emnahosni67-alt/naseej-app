@@ -1,0 +1,406 @@
+# Naseej sur Kubernetes (Minikube)
+# Prerequis : namespace "naseej" et secret "naseej-secret" crees avant (voir les commandes).
+# Contenu : auth-db, emergency-db (PostGIS), auth-service, emergency-service, api-gateway, web-frontend
+#
+# ======================= BASE DE DONNEES : AUTH =======================
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth-db
+  namespace: naseej
+spec:
+  type: ClusterIP
+  selector:
+    app: auth-db
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: auth-db
+  namespace: naseej
+spec:
+  serviceName: auth-db
+  replicas: 1
+  selector:
+    matchLabels:
+      app: auth-db
+  template:
+    metadata:
+      labels:
+        app: auth-db
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: naseej_user
+            - name: POSTGRES_DB
+              value: auth_db
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: naseej-secret
+                  key: AUTH_DB_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U naseej_user -d auth_db"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 12
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+---
+# ================ BASE DE DONNEES : EMERGENCY (PostGIS) ================
+apiVersion: v1
+kind: Service
+metadata:
+  name: emergency-db
+  namespace: naseej
+spec:
+  type: ClusterIP
+  selector:
+    app: emergency-db
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: emergency-db
+  namespace: naseej
+spec:
+  serviceName: emergency-db
+  replicas: 1
+  selector:
+    matchLabels:
+      app: emergency-db
+  template:
+    metadata:
+      labels:
+        app: emergency-db
+    spec:
+      containers:
+        - name: postgis
+          image: postgis/postgis:16-3.4-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: emergency_user
+            - name: POSTGRES_DB
+              value: emergency_db
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: naseej-secret
+                  key: EMERGENCY_DB_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U emergency_user -d emergency_db"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 12
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+---
+# ======================== AUTH-SERVICE ========================
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth-service
+  namespace: naseej
+spec:
+  type: ClusterIP
+  selector:
+    app: auth-service
+  ports:
+    - port: 3000
+      targetPort: 3000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-service
+  namespace: naseej
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: auth-service
+  template:
+    metadata:
+      labels:
+        app: auth-service
+    spec:
+      initContainers:
+        - name: wait-for-db
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "until pg_isready -h auth-db -p 5432; do echo attente auth-db; sleep 2; done"]
+      containers:
+        - name: auth-service
+          image: naseej-auth:1.0
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 3000
+          env:
+            - name: PORT
+              value: "3000"
+            - name: AUTH_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: naseej-secret
+                  key: AUTH_DB_PASSWORD
+            - name: DATABASE_URL
+              value: postgres://naseej_user:$(AUTH_DB_PASSWORD)@auth-db:5432/auth_db
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: naseej-secret
+                  key: JWT_SECRET
+            - name: JWT_ACCESS_TTL
+              value: 1h
+            - name: JWT_REFRESH_TTL
+              value: 7d
+            - name: DB_SYNC
+              value: "true"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 12
+---
+# ====================== EMERGENCY-SERVICE ======================
+apiVersion: v1
+kind: Service
+metadata:
+  name: emergency-service
+  namespace: naseej
+spec:
+  type: ClusterIP
+  selector:
+    app: emergency-service
+  ports:
+    - port: 3000
+      targetPort: 3000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: emergency-service
+  namespace: naseej
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: emergency-service
+  template:
+    metadata:
+      labels:
+        app: emergency-service
+    spec:
+      initContainers:
+        - name: wait-for-db
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "until pg_isready -h emergency-db -p 5432; do echo attente emergency-db; sleep 2; done"]
+      containers:
+        - name: emergency-service
+          image: naseej-emergency:1.0
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 3000
+          env:
+            - name: PORT
+              value: "3000"
+            - name: EMERGENCY_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: naseej-secret
+                  key: EMERGENCY_DB_PASSWORD
+            - name: DATABASE_URL
+              value: postgres://emergency_user:$(EMERGENCY_DB_PASSWORD)@emergency-db:5432/emergency_db
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: naseej-secret
+                  key: JWT_SECRET
+            - name: DB_SYNC
+              value: "true"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 12
+---
+# ========================= API-GATEWAY =========================
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-gateway
+  namespace: naseej
+spec:
+  type: ClusterIP
+  selector:
+    app: api-gateway
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  namespace: naseej
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api-gateway
+  template:
+    metadata:
+      labels:
+        app: api-gateway
+    spec:
+      containers:
+        - name: api-gateway
+          image: naseej-gateway:1.0
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: naseej-secret
+                  key: JWT_SECRET
+            - name: AUTH_URL
+              value: http://auth-service:3000
+            - name: EMERGENCY_URL
+              value: http://emergency-service:3000
+            # transport-service n'est pas deploye dans cette version (limite de RAM)
+            - name: TRANSPORT_URL
+              value: http://transport-service:3000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 6
+---
+# ========================= WEB-FRONTEND =========================
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-frontend
+  namespace: naseej
+spec:
+  type: ClusterIP
+  selector:
+    app: web-frontend
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-frontend
+  namespace: naseej
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web-frontend
+  template:
+    metadata:
+      labels:
+        app: web-frontend
+    spec:
+      containers:
+        - name: web-frontend
+          image: naseej-frontend:1.0
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+---
+# ========================= TRANSPORT-SERVICE (Mock minimal) =========================
+apiVersion: v1
+kind: Service
+metadata:
+  name: transport-service
+  namespace: naseej
+spec:
+  type: ClusterIP
+  selector:
+    app: transport-service
+  ports:
+    - port: 3000
+      targetPort: 3000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: transport-service
+  namespace: naseej
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: transport-service
+  template:
+    metadata:
+      labels:
+        app: transport-service
+    spec:
+      containers:
+        - name: transport-service
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "echo 'Transport mock running' && sleep 3600"]
+          ports:
+            - containerPort: 3000

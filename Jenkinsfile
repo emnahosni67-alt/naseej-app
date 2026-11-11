@@ -1,58 +1,73 @@
-// Pipeline Jenkins du projet Naseej
-// Declenche automatiquement par GitHub (verification du depot toutes les 2 minutes),
-// il recupere le code et construit une image Docker par microservice.
+// Pipeline CI/CD Naseej : GitHub -> Jenkins -> Docker -> Kubernetes (Minikube)
 pipeline {
-    agent any
+  agent any
 
-    options {
-        timestamps()                        // horodatage de chaque ligne du journal
-        buildDiscarder(logRotator(numToKeepStr: '10'))
+  options {
+    timeout(time: 30, unit: 'MINUTES')
+    timestamps()
+  }
+
+  environment {
+    NS   = 'naseej'
+    PATH = "/snap/bin:/usr/local/bin:/usr/bin:/bin"
+  }
+
+  stages {
+
+    stage('Recuperation du code (GitHub)') {
+      steps {
+        checkout scm
+        sh 'git log -1 --oneline'
+      }
     }
 
-    triggers {
-        pollSCM('H/2 * * * *')              // interroge GitHub toutes les 2 minutes
+    stage('Validation des manifestes K8s') {
+      steps {
+        sh 'kubectl apply --dry-run=client -f naseej-k8s.yaml'
+      }
     }
 
-    environment {
-        TAG = "${env.BUILD_NUMBER}"         // chaque image est etiquetee avec le numero du build
+    stage('Build des images Docker') {
+      steps {
+        sh '''
+          docker build -t naseej-auth:1.0      backend/auth-service
+          docker build -t naseej-emergency:1.0 backend/emergency-service
+          docker build -t naseej-gateway:1.0   backend/api-gateway
+          docker build -t naseej-frontend:1.0  frontend
+        '''
+      }
     }
 
-    stages {
-        stage('Checkout GitHub') {
-            steps {
-                checkout scm                // clone la branche main du depot GitHub
-                sh 'git log -1 --pretty=format:"Commit %h par %an : %s"'
-            }
-        }
-        stage('Build auth-service') {
-            steps {
-                sh 'docker build -t naseej-auth:${TAG} backend/auth-service'
-            }
-        }
-        stage('Build emergency-service') {
-            steps {
-                sh 'docker build -t naseej-emergency:${TAG} backend/emergency-service'
-            }
-        }
-        stage('Build api-gateway') {
-            steps {
-                sh 'docker build -t naseej-gateway:${TAG} backend/api-gateway'
-            }
-        }
-        stage('Build frontend') {
-            steps {
-                sh 'docker build -t naseej-frontend:${TAG} frontend'
-            }
-        }
-        stage('Verification des images') {
-            steps {
-                sh 'docker images --format "{{.Repository}}:{{.Tag}}  {{.Size}}" | grep -E "^naseej-[a-z]+:${TAG} "'
-            }
-        }
+    stage('Chargement des images dans Minikube') {
+      steps {
+        // Pas de registre : les images sont chargees directement dans le cluster
+        sh 'minikube image load naseej-auth:1.0 naseej-emergency:1.0 naseej-gateway:1.0 naseej-frontend:1.0'
+      }
     }
 
-    post {
-        success { echo "Build ${TAG} reussi : 4 images Docker construites depuis GitHub." }
-        failure { echo "Build ${TAG} en echec : consulter le journal de l'etape en rouge." }
+    stage('Deploiement sur Kubernetes') {
+      steps {
+        sh '''
+          kubectl apply -f naseej-k8s.yaml
+          kubectl rollout restart deployment -n $NS
+        '''
+      }
     }
+
+    stage('Verification du deploiement') {
+      steps {
+        sh '''
+          for d in auth-service emergency-service api-gateway web-frontend; do
+            kubectl rollout status deployment/$d -n $NS --timeout=240s
+          done
+          kubectl get pods -n $NS
+        '''
+      }
+    }
+  }
+
+  post {
+    success { echo 'Pipeline termine avec succes : application deployee.' }
+    failure { echo 'Pipeline en echec : voir les logs de l etape en rouge.' }
+  }
 }
