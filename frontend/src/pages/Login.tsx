@@ -83,19 +83,16 @@ export default function Login() {
               </p>
             )}
 
-            <Button type="submit" size="lg" fullWidth loading={loading} icon={<LogIn size={17} />}>
-              {t('auth.login.submit')}
-            </Button>
             <Button
-              type="submit"
-              size="lg"
-              fullWidth
-              loading={loading}
-              icon={<LogIn size={17} />}
-              className="!bg-emerald-500 !text-white hover:!bg-emerald-600"
-            >
-              {t('auth.login.submit')}
-            </Button>
+  type="submit"
+  size="lg"
+  fullWidth
+  loading={loading}
+  icon={<LogIn size={17} />}
+  style={{ backgroundColor: 'red', borderColor: 'red' }} // ou '#ef4444'
+>
+  {t('auth.login.submit')}
+</Button>
           </form>
 
           <div className="my-5 flex items-center gap-3">
