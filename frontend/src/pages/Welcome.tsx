@@ -102,7 +102,7 @@ export default function Welcome() {
         <Button
           size="lg"
           fullWidth
-          className="!bg-white !text-deep hover:!bg-white/90"
+          className="!bg-red !text-deep hover:!bg-white/90"
           onClick={() => navigate('/register')}
           icon={dir === 'rtl' ? <ArrowRight size={17} className="rotate-180" /> : <ArrowRight size={17} />}
         >
