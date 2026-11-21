@@ -1,0 +1,170 @@
+---
+# Playbook Ansible : deploiement automatique de Naseej sur Minikube
+# Lancer : ansible-playbook -i inventory.ini deploy-naseej.yml
+- name: Deploiement de Naseej (Minikube + monitoring)
+  hosts: local
+  gather_facts: true
+
+  vars:
+    repo_url: "https://github.com/cheriffarah000-maker/naseej-app.git"
+    repo_branch: main
+    project_dir: "{{ ansible_env.HOME }}/naseej-deploy"
+    grafana_password: "Naseej@2026"
+    images:
+      - { tag: "naseej-auth:1.0",      path: "backend/auth-service" }
+      - { tag: "naseej-emergency:1.0", path: "backend/emergency-service" }
+      - { tag: "naseej-gateway:1.0",   path: "backend/api-gateway" }
+      - { tag: "naseej-frontend:1.0",  path: "frontend" }
+    deployments:
+      - auth-service
+      - emergency-service
+      - api-gateway
+      - web-frontend
+    statefulsets:
+      - auth-db
+      - emergency-db
+
+  environment:
+    PATH: "/snap/bin:/usr/local/bin:/usr/bin:/bin"
+
+  tasks:
+
+    # ---------- 1. Outils ----------
+    - name: Verifier que Docker est installe
+      command: docker --version
+      register: docker_v
+      changed_when: false
+
+    - name: Verifier que kubectl est installe
+      command: kubectl version --client
+      changed_when: false
+
+    - name: Verifier que Minikube est installe
+      command: minikube version
+      changed_when: false
+
+    # ---------- 2. Cluster ----------
+    - name: Tester l'etat de Minikube
+      command: minikube status
+      register: mk_status
+      failed_when: false
+      changed_when: false
+
+    - name: Demarrer Minikube s'il est arrete
+      command: minikube start --driver=docker
+      when: mk_status.rc != 0
+
+    # ---------- 3. Code source depuis GitHub ----------
+    - name: Recuperer le code depuis GitHub
+      git:
+        repo: "{{ repo_url }}"
+        dest: "{{ project_dir }}"
+        version: "{{ repo_branch }}"
+        force: true
+
+    # ---------- 4. Images Docker ----------
+    - name: Construire les images Docker
+      command: "docker build -t {{ item.tag }} {{ item.path }}"
+      args:
+        chdir: "{{ project_dir }}"
+      loop: "{{ images }}"
+      register: build_out
+
+    - name: Charger les images dans Minikube
+      command: "minikube image load {{ images | map(attribute='tag') | join(' ') }}"
+
+    # ---------- 5. Namespaces et secrets ----------
+    - name: Creer les namespaces
+      shell: "kubectl create namespace {{ item }} --dry-run=client -o yaml | kubectl apply -f -"
+      loop: [naseej, monitoring]
+      register: ns_out
+      changed_when: "'created' in ns_out.stdout"
+
+    - name: Tester si le secret de l'application existe
+      command: kubectl get secret naseej-secret -n naseej
+      register: secret_app
+      failed_when: false
+      changed_when: false
+
+    - name: Creer le secret de l'application (mots de passe aleatoires)
+      shell: |
+        kubectl create secret generic naseej-secret -n naseej \
+          --from-literal=AUTH_DB_PASSWORD=$(openssl rand -hex 16) \
+          --from-literal=EMERGENCY_DB_PASSWORD=$(openssl rand -hex 16) \
+          --from-literal=JWT_SECRET=$(openssl rand -hex 48)
+      args:
+        executable: /bin/bash
+      when: secret_app.rc != 0
+
+    - name: Tester si le secret Grafana existe
+      command: kubectl get secret grafana-secret -n monitoring
+      register: secret_graf
+      failed_when: false
+      changed_when: false
+
+    - name: Creer le secret Grafana
+      command: >
+        kubectl create secret generic grafana-secret -n monitoring
+        --from-literal=GF_SECURITY_ADMIN_PASSWORD={{ grafana_password }}
+      when: secret_graf.rc != 0
+      no_log: true
+
+    # ---------- 6. Deploiement ----------
+    - name: Appliquer les manifestes de l'application
+      command: kubectl apply -f naseej-k8s.yaml
+      args:
+        chdir: "{{ project_dir }}"
+      register: apply_app
+      changed_when: "'created' in apply_app.stdout or 'configured' in apply_app.stdout"
+
+    - name: Chercher le manifeste de supervision
+      stat:
+        path: "{{ project_dir }}/naseej-monitoring.yaml"
+      register: mon_file
+
+    - name: Appliquer les manifestes Prometheus et Grafana
+      command: kubectl apply -f naseej-monitoring.yaml
+      args:
+        chdir: "{{ project_dir }}"
+      register: apply_mon
+      changed_when: "'created' in apply_mon.stdout or 'configured' in apply_mon.stdout"
+      when: mon_file.stat.exists
+
+    # ---------- 7. Verification ----------
+    - name: Attendre que les bases soient pretes
+      command: "kubectl rollout status statefulset/{{ item }} -n naseej --timeout=300s"
+      loop: "{{ statefulsets }}"
+      changed_when: false
+
+    - name: Attendre que les services soient prets
+      command: "kubectl rollout status deployment/{{ item }} -n naseej --timeout=300s"
+      loop: "{{ deployments }}"
+      changed_when: false
+
+    - name: Lister les pods de l'application
+      command: kubectl get pods -n naseej
+      register: pods_app
+      changed_when: false
+
+    - name: Afficher les pods
+      debug:
+        var: pods_app.stdout_lines
+
+    # ---------- 8. Script des tunnels ----------
+    - name: Creer le script des port-forward
+      copy:
+        dest: "{{ ansible_env.HOME }}/pf.sh"
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          pkill -f "kubectl port-forward" 2>/dev/null
+          sleep 1
+          nohup kubectl port-forward -n naseej svc/api-gateway 8080:8080 --address 0.0.0.0 >/tmp/pf-gw.log 2>&1 &
+          nohup kubectl port-forward -n naseej svc/web-frontend 5173:8080 --address 0.0.0.0 >/tmp/pf-web.log 2>&1 &
+          nohup kubectl port-forward -n monitoring svc/prometheus 9090:9090 --address 0.0.0.0 >/tmp/pf-prom.log 2>&1 &
+          nohup kubectl port-forward -n monitoring svc/grafana 3000:3000 --address 0.0.0.0 >/tmp/pf-graf.log 2>&1 &
+          echo "Tunnels lances"
+
+    - name: Rappel
+      debug:
+        msg: "Deploiement termine. Lance ~/pf.sh puis ouvre http://localhost:5173"
